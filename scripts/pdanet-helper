@@ -187,21 +187,24 @@ stop_dns() {
 
 save_state() {
   mkdir -p "$STATE_DIR"
-  cat > "$STATE" <<EOF
-MODE=$1
-IFACE=$2
-GW=${3:-}
-PORT=$4
-PROTO=$5
-STEALTH=$6
-SSID="${7}"
-PREV_SSID="${8}"
-START_TS=$(date +%s)
-RP_ALL=$(sysctl -n net.ipv4.conf.all.rp_filter)
-RP_IFACE=$(sysctl -n "net.ipv4.conf.$2.rp_filter")
-V6_ALL=$(sysctl -n net.ipv6.conf.all.disable_ipv6)
-V6_IFACE=$(sysctl -n "net.ipv6.conf.$2.disable_ipv6")
-EOF
+  local mode=$1 iface=$2 gw=${3:-} port=$4 proto=$5 stealth=$6
+  local ssid=${7:-} prev_ssid=${8:-} default_route=${9:-}
+  {
+    printf 'MODE=%q\n' "$mode"
+    printf 'IFACE=%q\n' "$iface"
+    printf 'GW=%q\n' "$gw"
+    printf 'PORT=%q\n' "$port"
+    printf 'PROTO=%q\n' "$proto"
+    printf 'STEALTH=%q\n' "$stealth"
+    printf 'SSID=%q\n' "$ssid"
+    printf 'PREV_SSID=%q\n' "$prev_ssid"
+    printf 'ORIGINAL_DEFAULT_ROUTE=%q\n' "$default_route"
+    printf 'START_TS=%q\n' "$(date +%s)"
+    printf 'RP_ALL=%q\n' "$(sysctl -n net.ipv4.conf.all.rp_filter)"
+    printf 'RP_IFACE=%q\n' "$(sysctl -n "net.ipv4.conf.$iface.rp_filter")"
+    printf 'V6_ALL=%q\n' "$(sysctl -n net.ipv6.conf.all.disable_ipv6)"
+    printf 'V6_IFACE=%q\n' "$(sysctl -n "net.ipv6.conf.$iface.disable_ipv6")"
+  } > "$STATE"
   chmod 600 "$STATE"
 }
 
@@ -210,6 +213,9 @@ bring_up_tun() {
   ip tuntap add mode tun dev "$TUN_DEV" 2>/dev/null || true
   ip addr replace "$TUN_CIDR" dev "$TUN_DEV"
   ip link set "$TUN_DEV" up mtu 1400
+  if [ -n "$iface" ] && [ -n "${GW:-}" ]; then
+    ip route replace "$GW/32" dev "$iface"
+  fi
   ip route replace default dev "$TUN_DEV" metric "$TUN_METRIC"
 
   local args=( -device "$TUN_DEV" -proxy "$proxy_uri" -loglevel warn )
@@ -275,7 +281,9 @@ cmd_up() {
   local proto
   proto=$(echo "$hit" | awk '{print $3}')
 
-  save_state wifi "$iface" "$gw" "$port" "$proto" "$stealth" "$ssid" "$prev"
+  local original_route
+  original_route=$(ip -4 route show default | head -1)
+  save_state wifi "$iface" "$gw" "$port" "$proto" "$stealth" "$ssid" "$prev" "$original_route"
   MODE=wifi
   GW=$gw
   apply_stealth "$iface" "$stealth" wifi
@@ -314,7 +322,9 @@ cmd_usb_up() {
   local proto
   proto=$(echo "$proto_hit" | awk '{print $3}')
 
-  save_state usb lo "" "$port" "$proto" "$stealth" "" ""
+  local original_route
+  original_route=$(ip -4 route show default | head -1)
+  save_state usb lo "" "$port" "$proto" "$stealth" "" "" "$original_route"
   MODE=usb
   GW=""
   apply_stealth lo "$stealth" usb
@@ -343,6 +353,11 @@ cmd_down() {
   stop_dns
   ip link del "$TUN_DEV" >/dev/null 2>&1 || true
   remove_stealth
+
+  if [ -n "${ORIGINAL_DEFAULT_ROUTE:-}" ]; then
+    read -r -a original_route_args <<< "$ORIGINAL_DEFAULT_ROUTE"
+    ip route replace "${original_route_args[@]}" >/dev/null 2>&1 || true
+  fi
 
   sysctl -q -w "net.ipv4.conf.all.rp_filter=${RP_ALL:-1}"
   [ -n "${IFACE:-}" ] && [ "$IFACE" != "lo" ] && sysctl -q -w "net.ipv4.conf.$IFACE.rp_filter=${RP_IFACE:-1}" 2>/dev/null || true
