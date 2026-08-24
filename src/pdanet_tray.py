@@ -29,7 +29,7 @@ from gi.repository import AyatanaAppIndicator3 as AppIndicator
 from gi.repository import Gdk, GLib, Gtk, Notify
 
 INSTALLED_HELPER = pathlib.Path("/usr/local/bin/pdanet-helper")
-ICONS = pathlib.Path("/usr/local/share/pdanet/icons")
+ICONS = pathlib.Path("/usr/local/share/pollypdanet")
 CONFIG_DIR = pathlib.Path.home() / ".config" / "pdanet-linux"
 CONFIG_FILE = CONFIG_DIR / "tray.json"
 USB_FORWARD_PORT = 48765
