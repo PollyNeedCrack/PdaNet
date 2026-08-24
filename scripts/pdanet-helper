@@ -149,6 +149,10 @@ remove_stealth() {
 
 start_dns() {
   # Prefer dnsproxy (DoH over TCP - works through ANY proxy type).
+  # Mullvad uses 10.64.0.1 as its in-tunnel resolver. Keep those queries
+  # out of PdaNet's generic DNS DNAT rules so Mullvad can answer them.
+  iptables -t nat -A PDANET_DNS -d 10.64.0.1 -p udp --dport 53 -j RETURN
+  iptables -t nat -A PDANET_DNS -d 10.64.0.1 -p tcp --dport 53 -j RETURN
   iptables -t nat -A PDANET_DNS -d 127.0.0.53 -j RETURN
   if command -v dnsproxy >/dev/null 2>&1; then
     setsid dnsproxy -l "$DNS_LISTEN" -p 53 \
