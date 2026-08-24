@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=PdaNet
+Comment=PdaNet+ tethering client for Linux (USB + WiFi)
+Exec=pdanet-app
+Icon=/usr/local/share/pollypdanet/pdanet-off.svg
+Terminal=false
+Categories=Network;Utility;
+Keywords=pdanet;tether;hotspot;usb;wifi;
+X-GNOME-Autostart-enabled=true

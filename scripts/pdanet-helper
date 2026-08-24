@@ -1,0 +1,437 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR=/run/pdanet
+STATE=$STATE_DIR/state.env
+LOG=$STATE_DIR/tun2socks.log
+DNSLOG=$STATE_DIR/dnsproxy.log
+PIDFILE=$STATE_DIR/tun2socks.pid
+DNSPIDFILE=$STATE_DIR/dnsproxy.pid
+TUN_DEV=pdanet0
+TUN_CIDR=198.18.0.1/15
+TUN_METRIC=90
+DEFAULT_PORT=8000
+DEFAULT_USB_PORT=48765
+PROBE_URL=http://www.gstatic.com/generate_204
+SCAN_PORTS="8000 8080 3128 8888 9090"
+DNS_LISTEN=127.0.0.42
+
+is_root() { [ "$(id -u)" = 0 ]; }
+
+die() {
+  local msg=${1//\"/\\\"}
+  printf '{"ok":false,"error":"%s"}\n' "$msg"
+  exit 1
+}
+
+emit() {
+  python3 - "$@" <<'PY'
+import json, sys
+print(json.dumps(dict(a.split("=", 1) for a in sys.argv[1:])))
+PY
+}
+
+connected() { [ -f "$STATE" ]; }
+
+wifi_iface() {
+  nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null \
+    | awk -F: '$2 == "wifi" && $3 == "connected" { print $1; exit }'
+}
+
+current_ssid() {
+  local iface=${1:-$(wifi_iface)}
+  [ -n "$iface" ] || return 0
+  local s
+  s=$(nmcli -g GENERAL.CONNECTION device show "$iface" 2>/dev/null | head -1)
+  [ "$s" = "--" ] && s=""
+  printf '%s' "$s"
+}
+
+route_gw() {
+  ip route show default dev "$1" 2>/dev/null \
+    | awk '{ for (i = 1; i <= NF; i++) if ($i == "via") { print $(i+1); exit } }'
+}
+
+probe_proxy() {
+  local gw=$1 port=$2 proto=$3 code
+  if [ "$proto" = "http" ]; then
+    code=$(curl -m 6 -sS -x "http://$gw:$port" -o /dev/null -w '%{http_code}' "$PROBE_URL" 2>/dev/null)
+  else
+    code=$(curl -m 6 -sS --socks5-hostname "$gw:$port" -o /dev/null -w '%{http_code}' "$PROBE_URL" 2>/dev/null)
+  fi
+  printf '%s' "${code:-000}"
+  return 0
+}
+
+# try each candidate port with socks5 then http; prints "gw port proto"
+detect_proxy() {
+  local gw=$1 ports=$2 port proto code
+  for port in $ports; do
+    for proto in socks5 http; do
+      code=$(probe_proxy "$gw" "$port" "$proto")
+      if [ "$code" = "200" ] || [ "$code" = "204" ]; then
+        printf '%s %s %s' "$gw" "$port" "$proto"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+restore_prev_wifi() {
+  local prev=${PREV_SSID:-}
+  [ -n "$prev" ] || return 0
+  [ "$prev" != "${SSID:-}" ] || return 0
+  nmcli con up id "$prev" >/dev/null 2>&1 || true
+}
+
+ensure_wifi() {
+  local ssid=$1 pass=$2
+  nmcli radio wifi on >/dev/null 2>&1 || true
+
+  if nmcli -g NAME connection show 2>/dev/null | grep -Fxq -- "$ssid"; then
+    nmcli con up id "$ssid" >/dev/null 2>&1 && return 0
+    [ -n "$pass" ] || return 1
+    nmcli con delete id "$ssid" >/dev/null 2>&1 || true
+  fi
+
+  if [ -n "$pass" ]; then
+    nmcli device wifi connect "$ssid" password "$pass" >/dev/null 2>&1 && return 0
+    nmcli connection delete id "$ssid" >/dev/null 2>&1 || true
+    nmcli device wifi connect "$ssid" password "$pass" >/dev/null 2>&1 && return 0
+    return 1
+  fi
+
+  nmcli device wifi connect "$ssid" >/dev/null 2>&1
+}
+
+wait_iface() {
+  local i=0
+  while [ "$i" -lt 30 ]; do
+    [ -n "$(wifi_iface)" ] && return 0
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+apply_stealth() {
+  # $1 iface  $2 level  $3 mode(wifi|usb)
+  local iface=$1 level=$2 mode=$3
+
+  if [ "$mode" = "wifi" ]; then
+    iptables -t mangle -N PDANET_TTL 2>/dev/null || iptables -t mangle -F PDANET_TTL
+    iptables -t mangle -A PDANET_TTL -o "$iface" -j TTL --ttl-set 65
+    iptables -t mangle -C POSTROUTING -j PDANET_TTL 2>/dev/null \
+      || iptables -t mangle -A POSTROUTING -j PDANET_TTL
+  fi
+
+  sysctl -q -w "net.ipv4.conf.all.rp_filter=0"
+  [ "$iface" != "lo" ] && sysctl -q -w "net.ipv4.conf.$iface.rp_filter=0"
+
+  # DNS redirect chain exists in all modes/levels; rules are added by start_dns
+  iptables -t nat -N PDANET_DNS 2>/dev/null || iptables -t nat -F PDANET_DNS
+
+  [ "$level" -ge 2 ] || return 0
+
+  sysctl -q -w "net.ipv6.conf.all.disable_ipv6=1"
+  [ "$iface" != "lo" ] && sysctl -q -w "net.ipv6.conf.$iface.disable_ipv6=1"
+}
+
+remove_stealth() {
+  iptables -t mangle -D POSTROUTING -j PDANET_TTL 2>/dev/null || true
+  iptables -t mangle -F PDANET_TTL 2>/dev/null || true
+  iptables -t mangle -X PDANET_TTL 2>/dev/null || true
+  iptables -t nat -D OUTPUT -j PDANET_DNS 2>/dev/null || true
+  iptables -t nat -F PDANET_DNS 2>/dev/null || true
+  iptables -t nat -X PDANET_DNS 2>/dev/null || true
+}
+
+start_dns() {
+  # Prefer dnsproxy (DoH over TCP - works through ANY proxy type).
+  iptables -t nat -A PDANET_DNS -d 127.0.0.53 -j RETURN
+  if command -v dnsproxy >/dev/null 2>&1; then
+    setsid dnsproxy -l "$DNS_LISTEN" -p 53 \
+      -u "https://1.1.1.1/dns-query" -u "https://8.8.8.8/dns-query" \
+      --cache --timeout 3s >"$DNSLOG" 2>&1 &
+    echo $! > "$DNSPIDFILE"
+    sleep 1
+    if kill -0 "$(cat "$DNSPIDFILE")" 2>/dev/null; then
+      iptables -t nat -A PDANET_DNS -p udp --dport 53 -j DNAT --to-destination "$DNS_LISTEN:53"
+      iptables -t nat -A PDANET_DNS -p tcp --dport 53 -j DNAT --to-destination "$DNS_LISTEN:53"
+      iptables -t nat -C OUTPUT -j PDANET_DNS 2>/dev/null \
+        || iptables -t nat -I OUTPUT 1 -j PDANET_DNS
+      printf 'doh'
+      return 0
+    fi
+  fi
+  # Fallback: punt DNS at the phone gateway (works when the hotspot resolves).
+  if [ -n "${GW:-}" ] && [ "$MODE" != "usb" ]; then
+    iptables -t nat -A PDANET_DNS -p udp --dport 53 -j DNAT --to-destination "$GW:53"
+    iptables -t nat -A PDANET_DNS -p tcp --dport 53 -j DNAT --to-destination "$GW:53"
+    iptables -t nat -C OUTPUT -j PDANET_DNS 2>/dev/null \
+      || iptables -t nat -I OUTPUT 1 -j PDANET_DNS
+    printf 'gateway'
+    return 0
+  fi
+  printf 'none'
+  return 0
+}
+
+stop_dns() {
+  if [ -f "$DNSPIDFILE" ]; then
+    kill "$(cat "$DNSPIDFILE")" >/dev/null 2>&1 || true
+    rm -f "$DNSPIDFILE"
+  fi
+}
+
+save_state() {
+  mkdir -p "$STATE_DIR"
+  cat > "$STATE" <<EOF
+MODE=$1
+IFACE=$2
+GW=${3:-}
+PORT=$4
+PROTO=$5
+STEALTH=$6
+SSID="${7}"
+PREV_SSID="${8}"
+START_TS=$(date +%s)
+RP_ALL=$(sysctl -n net.ipv4.conf.all.rp_filter)
+RP_IFACE=$(sysctl -n "net.ipv4.conf.$2.rp_filter")
+V6_ALL=$(sysctl -n net.ipv6.conf.all.disable_ipv6)
+V6_IFACE=$(sysctl -n "net.ipv6.conf.$2.disable_ipv6")
+EOF
+  chmod 600 "$STATE"
+}
+
+bring_up_tun() {
+  local proxy_uri=$1 iface=${2:-}
+  ip tuntap add mode tun dev "$TUN_DEV" 2>/dev/null || true
+  ip addr replace "$TUN_CIDR" dev "$TUN_DEV"
+  ip link set "$TUN_DEV" up mtu 1400
+  ip route replace default dev "$TUN_DEV" metric "$TUN_METRIC"
+
+  local args=( -device "$TUN_DEV" -proxy "$proxy_uri" -loglevel warn )
+  [ -n "$iface" ] && args+=( -interface "$iface" )
+
+  setsid tun2socks "${args[@]}" >"$LOG" 2>&1 &
+  echo $! > "$PIDFILE"
+  sleep 1
+  if ! kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    cmd_down >/dev/null 2>&1 || true
+    die "tun2socks failed to start - see $LOG"
+  fi
+}
+
+cmd_up() {
+  is_root || die "must run as root"
+  connected && die "already connected"
+
+  local ssid="" pass="" stealth=2 port="" auto_ports=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ssid) ssid=$2; shift 2 ;;
+      --password) pass=$2; shift 2 ;;
+      --stealth) stealth=$2; shift 2 ;;
+      --port) port=$2; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [ -n "$ssid" ] || die "--ssid required"
+
+  for bin in tun2socks iptables nmcli curl ip python3; do
+    command -v "$bin" >/dev/null || die "missing dependency: $bin"
+  done
+
+  local prev
+  prev=$(current_ssid)
+  CHOSEN_SSID=$ssid
+  PREV_SSID=$prev
+
+  ensure_wifi "$ssid" "$pass" || { PREV_SSID=$prev restore_prev_wifi; die "could not associate to '$ssid' - check password or hotspot"; }
+  wait_iface || { PREV_SSID=$prev restore_prev_wifi; die "wifi did not come up"; }
+
+  local iface gw
+  iface=$(wifi_iface)
+  gw=$(route_gw "$iface")
+  [ -n "$gw" ] || { PREV_SSID=$prev restore_prev_wifi; die "no gateway found on $iface"; }
+
+  # figure out which ports to try
+  local ports
+  if [ -n "$port" ] && [ "$port" != "auto" ]; then
+    ports="$port ${SCAN_PORTS}"
+  else
+    ports="${port:-} $SCAN_PORTS"
+  fi
+
+  local hit
+  hit=$(detect_proxy "$gw" "$ports") || {
+    PREV_SSID=$prev restore_prev_wifi
+    die "PdaNet proxy not found on $gw (scanned: $ports) - enable WiFi Direct Hotspot / proxy in the PdaNet app"
+  }
+  gw=$(echo "$hit" | awk '{print $1}')
+  port=$(echo "$hit" | awk '{print $2}')
+  local proto
+  proto=$(echo "$hit" | awk '{print $3}')
+
+  save_state wifi "$iface" "$gw" "$port" "$proto" "$stealth" "$ssid" "$prev"
+  MODE=wifi
+  GW=$gw
+  apply_stealth "$iface" "$stealth" wifi
+
+  local dns_mode
+  dns_mode=$(start_dns)
+
+  bring_up_tun "$proto://$gw:$port" "$iface"
+
+  emit ok=true state=connected mode=wifi ssid="$ssid" iface="$iface" gw="$gw" port="$port" \
+    proto="$proto" stealth="$stealth" dns="$dns_mode" restored_prev=""
+}
+
+cmd_usb_up() {
+  is_root || die "must run as root"
+  connected && die "already connected"
+
+  local port=$DEFAULT_USB_PORT stealth=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --port) port=$2; shift 2 ;;
+      --stealth) stealth=$2; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  for bin in tun2socks curl ip python3; do
+    command -v "$bin" >/dev/null || die "missing dependency: $bin"
+  done
+
+  timeout 3 bash -c "</dev/tcp/127.0.0.1/$port" >/dev/null 2>&1 \
+    || die "nothing listening on 127.0.0.1:$port - connect USB in the tray app first (it runs adb forward)"
+
+  local proto_hit
+  proto_hit=$(detect_proxy 127.0.0.1 "$port") || die "phone service on 127.0.0.1:$port is not an http/socks5 proxy"
+  local proto
+  proto=$(echo "$proto_hit" | awk '{print $3}')
+
+  save_state usb lo "" "$port" "$proto" "$stealth" "" ""
+  MODE=usb
+  GW=""
+  apply_stealth lo "$stealth" usb
+
+  local dns_mode
+  dns_mode=$(start_dns)
+
+  bring_up_tun "$proto://127.0.0.1:$port" ""
+
+  emit ok=true state=connected mode=usb iface="adb" port="$port" proto="$proto" stealth="$stealth" dns="$dns_mode"
+}
+
+cmd_down() {
+  is_root || die "must run as root"
+  if ! connected; then
+    emit ok=true state=disconnected
+    return 0
+  fi
+
+  # shellcheck source=/dev/null
+  . "$STATE"
+
+  if [ -f "$PIDFILE" ]; then
+    kill "$(cat "$PIDFILE")" >/dev/null 2>&1 || true
+  fi
+  stop_dns
+  ip link del "$TUN_DEV" >/dev/null 2>&1 || true
+  remove_stealth
+
+  sysctl -q -w "net.ipv4.conf.all.rp_filter=${RP_ALL:-1}"
+  [ -n "${IFACE:-}" ] && [ "$IFACE" != "lo" ] && sysctl -q -w "net.ipv4.conf.$IFACE.rp_filter=${RP_IFACE:-1}" 2>/dev/null || true
+
+  if [ "${STEALTH:-1}" -ge 2 ]; then
+    sysctl -q -w "net.ipv6.conf.all.disable_ipv6=${V6_ALL:-0}"
+    [ -n "${IFACE:-}" ] && [ "$IFACE" != "lo" ] && sysctl -q -w "net.ipv6.conf.$IFACE.disable_ipv6=${V6_IFACE:-0}" 2>/dev/null || true
+  fi
+
+  rm -f "$STATE" "$PIDFILE"
+
+  # hand back the network the user was on before tethering
+  restore_prev_wifi
+
+  emit ok=true state=disconnected restored="$([ -n "${PREV_SSID:-}" ] && echo "${PREV_SSID}" || echo none)"
+}
+
+cmd_status() {
+  if ! connected; then
+    emit state=disconnected
+    return 0
+  fi
+
+  # shellcheck source=/dev/null
+  . "$STATE"
+  local mode=${MODE:-wifi}
+
+  local alive=false rx=0 tx=0 ttl=false dns=false v6=false ssid=""
+  kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null && alive=true
+
+  if [ -r "/sys/class/net/$TUN_DEV/statistics/rx_bytes" ]; then
+    rx=$(cat "/sys/class/net/$TUN_DEV/statistics/rx_bytes")
+    tx=$(cat "/sys/class/net/$TUN_DEV/statistics/tx_bytes")
+  fi
+
+  if is_root; then
+    iptables -t mangle -S PDANET_TTL 2>/dev/null | grep -q 'ttl-set' && ttl=true
+    iptables -t nat -S PDANET_DNS 2>/dev/null | grep -q 'DNAT' && dns=true
+    [ "$(sysctl -n net.ipv6.conf.all.disable_ipv6)" = "1" ] && v6=true
+  fi
+
+  if [ "$mode" = "wifi" ]; then
+    ssid=$(current_ssid "$IFACE")
+  fi
+
+  emit state=connected mode="$mode" alive="$alive" ssid="$ssid" iface="$IFACE" gw="${GW:-}" port="$PORT" \
+    stealth="$STEALTH" uptime=$(( $(date +%s) - START_TS )) rx_bytes="$rx" tx_bytes="$tx" \
+    ttl_on="$ttl" dns_on="$dns" v6_blocked="$v6"
+}
+
+cmd_scan() {
+  nmcli -g IN-USE,SSID,SIGNAL,SECURITY device wifi list --rescan yes 2>/dev/null \
+    | python3 -c '
+import re, sys, json
+nets = []
+for line in sys.stdin:
+    parts = re.split(r"(?<!\\):", line.rstrip("\n"))
+    if len(parts) < 4:
+        continue
+    in_use, ssid, signal, security = parts[0], parts[1], parts[2], parts[3]
+    ssid = ssid.replace("\\:", ":")
+    if not ssid:
+        continue
+    nets.append({"ssid": ssid, "in_use": in_use == "*", "signal": int(signal or 0), "security": security})
+nets.sort(key=lambda n: (-n["in_use"], -n["signal"]))
+print(json.dumps({"ok": True, "networks": nets}))
+'
+}
+
+case "${1:-help}" in
+  up) shift; cmd_up "$@" ;;
+  usb-up) shift; cmd_usb_up "$@" ;;
+  down) cmd_down ;;
+  status) cmd_status ;;
+  scan) cmd_scan ;;
+  help|*)
+    cat <<EOF
+usage: pdanet-helper <command> [options]
+
+commands:
+  scan                          list visible wifi networks (JSON)
+  up   --ssid SSID [--password PW] [--stealth 1|2] [--port N|auto]
+                                join hotspot, autodetect its proxy port/proto,
+                                tunnel system-wide (auto-restores previous wifi on failure)
+  usb-up [--port N] [--stealth 0|1]
+                                tunnel system-wide through an adb-forwarded phone socket
+                                (tray app runs 'adb forward tcp:N localabstract:pdanet' first)
+  down                          disconnect, undo stealth, reconnect previous wifi
+  status                        current tunnel state (JSON)
+EOF
+    ;;
+esac
