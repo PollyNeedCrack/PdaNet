@@ -18,7 +18,7 @@ MISSING=()
 for bin in python3 tun2socks iptables nmcli curl ip dnsproxy; do
     command -v "$bin" >/dev/null || MISSING+=("$bin")
 done
-for pkg in gtk3 libayatana-appindicator3 gir1.2-ayatanaappindicator3-0.1 notification-daemon; do
+for pkg in gtk3 libayatana-appindicator; do
     pacman -Q "$pkg" >/dev/null 2>&1 || MISSING+=("$pkg (pacman)")
 done
 if [ ${#MISSING[@]} -gt 0 ]; then
@@ -45,9 +45,9 @@ printf '%s ALL=(root) NOPASSWD: /usr/local/bin/pdanet-helper\n' "$REAL_USER" > "
 chmod 440 "$SUDOERS_FILE"
 
 echo -e "${YELLOW}[6/6]${NC} Installing menu launcher..."
-cp "$PROJECT_DIR/config/pdanet.desktop" /usr/local/share/applications/pdanet.desktop
-chmod 644 /usr/local/share/applications/pdanet.desktop
-update-desktop-database /usr/local/share/applications 2>/dev/null || true
+cp "$PROJECT_DIR/config/pdanet.desktop" /usr/share/applications/pdanet.desktop
+chmod 644 /usr/share/applications/pdanet.desktop
+update-desktop-database /usr/share/applications 2>/dev/null || true
 
 echo ""
 echo -e "${GREEN}Installed! Launch 'PdaNet' from your app menu,"

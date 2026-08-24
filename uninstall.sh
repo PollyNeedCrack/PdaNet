@@ -13,6 +13,6 @@ rm -f /usr/local/bin/pdanet-app /usr/local/bin/pdanet-helper
 rm -rf /usr/local/share/pollypdanet
 rm -f /usr/local/share/applications/pdanet.desktop
 rm -f /etc/sudoers.d/pdanet-helper
-update-desktop-database /usr/local/share/applications 2>/dev/null || true
+update-desktop-database /usr/share/applications 2>/dev/null || true
 
 echo "PollyPdaNet removed. (User settings kept in ~/.config/pdanet-linux/)"
