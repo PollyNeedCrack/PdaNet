@@ -1,4 +1,13 @@
-# PollyPdaNet
+# Real person note at the top here
+
+This entire thing was made by me feeding prompts into AI Agents, im not a dev at all unless you count that as developing.
+i believe this is the first PdaNet Application that works for arch properly, i use omarchy so i made it all for omarchy where it sits in the taskbar and all that.
+If you want to use this hopefully all the instructions below also written by AI helps you get it set up, sorry if it dont, but this all works perfectly for me.
+
+The only downside to this is the moment your phones screen turns off, you lose internet completely, i worked around that with an application i found on the app store that keeps the screen on all the time
+
+
+# PdaNet For Linux/Arch/Omarchy
 
 PdaNet+ tethering client for Linux with a Windows-exe-style system tray interface.
 
