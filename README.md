@@ -42,7 +42,7 @@ Disconnect hands your old network back too.
 
 ```bash
 sudo pacman -S --needed tun2socks dnsproxy gtk3 libayatana-appindicator android-tools
-git clone <your-repo-url> PollyPdaNet
+git clone https://github.com/PollyNeedCrack/PdaNet
 cd PollyPdaNet
 sudo ./install.sh
 ```
